@@ -1,0 +1,222 @@
+name: SAST & DAST pipeline
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  sast-codeql:
+    name: CodeQL SAST Analysis
+    runs-on: ubuntu-latest
+
+    # Modify the language array with the languages of the repo which are to be analyzed
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript']
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Initizlize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      
+      - name: CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+
+  sca:
+    name: Dependency analysis with Trivy
+    runs-on: ubuntu-latest
+    needs: [sast-codeql]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create reports directory
+      run: mkdir -p reports/trivy
+
+    - name: Build Docker image
+      run: |
+        docker build -t web-app:latest .
+    
+    # Dependency vulnerability check based on dependency files as requierements.txt
+    - name: Run Trivy vulnerability scanner on repository packages and dependency files
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'reports/trivy/trivy-repo.sarif'
+        title: 'Dependencies Vulnerabilities'
+        exit-code: '1'
+        severity: 'CRITICAL'
+
+    # Configuration check of IaC and Dockerfile files
+    - name: Run Trivy config scanner on IaC and Dockerfiles
+      if: always()
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'config'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'reports/trivy/trivy-config.sarif'
+        title: 'IaC and Dockerfile Vulnerabilities'
+        exit-code: '1'
+        severity: 'CRITICAL'
+
+    # Check for vulns on Docker built container 
+    - name: Run Trivy vulnerability scanner on Docker image
+      if: always()
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'web-app:latest'
+        format: 'sarif'
+        output: 'reports/trivy/trivy-image.sarif'
+        title: 'Docker Image Vulnerabilities'
+        exit-code: '1'
+        severity: 'CRITICAL'
+
+    - name: Upload Trivy SARIF results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/trivy/trivy-repo.sarif
+        category: "trivy-repository"
+      if: always()
+
+    - name: Upload Trivy Image SARIF results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/trivy/trivy-image.sarif
+        category: "trivy-image"
+      if: always()
+
+    - name: Upload Trivy Config SARIF results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/trivy/trivy-config.sarif
+        category: "trivy-config"
+      if: always()
+
+  dast:
+      name: Pruebas DAST
+      runs-on: ubuntu-latest
+      needs: [sca]
+      env:
+        # Set port which will listen for web app
+        DOCKER_PORT: 3000
+      
+      steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create Docker network
+        run: docker network create dast-network
+
+      - name: Create ZAP working directory
+        run: |
+          mkdir -p ${{ github.workspace }}/zap-reports
+          chmod 777 ${{ github.workspace }}/zap-reports
+
+      - name: Build test application
+        run: |
+          docker build -t test-app:latest .
+        
+      - name: Start test application and wait for it to be ready
+        run: |
+          docker run -d \
+            --name test-app \
+            --network dast-network \
+            -p ${DOCKER_PORT}:${DOCKER_PORT} \
+            test-app:latest
+
+          echo "Waiting for application to start..."
+          sleep 30
+          # Verificar que la aplicación responde
+          timeout 60 bash -c 'until curl -f http://localhost:${DOCKER_PORT}/health || curl -f http://localhost:${DOCKER_PORT}/ ; do sleep 5; done'
+
+
+      - name: Run ZAP Baseline Scan
+        run: |
+          docker run --rm \
+            --name zap-scan \
+            --network dast-network \
+            -v ${{ github.workspace }}/zap-reports:/zap/wrk \
+            -u root \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://test-app:${DOCKER_PORT} \
+            -r zap-baseline-report.html \
+            -x zap-baseline-report.xml \
+            -J zap-baseline-report.json \
+            -I \
+            -a \
+            -j
+
+      ###########################
+      # ZAP Full Scan consumes a great time and resources,thus it is left commented. In order to execute it uncomment the code, being responsible of the usage of GitHub Actions minutes
+      ###########################
+      # - name: Run ZAP Full Scan (más exhaustivo)
+      #   run: |
+      #     docker run --rm \
+      #       --name zap-full-scan \
+      #       --network dast-network \
+      #       -v ${{ github.workspace }}/zap-reports:/zap/wrk \
+      #       -u root \
+      #       ghcr.io/zaproxy/zaproxy:stable \
+      #       zap-full-scan.py \
+      #       -t http://test-app:${DOCKER_PORT} \
+      #       -r zap-full-report.html \
+      #       -x zap-full-report.xml \
+      #       -J zap-full-report.json \
+      #       -a \
+      #       -j
+
+      - name: Check application logs (debugging)
+        if: always()
+        run: |
+          echo "=== Application logs ==="
+          docker logs test-app || true
+
+      - name: List generated reports
+        if: always()
+        run: |
+          echo "=== Generated reports ==="
+          ls -la ${{ github.workspace }}/zap-reports/
+
+      - name: Upload ZAP Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-security-reports
+          path: |
+            ${{ github.workspace }}/zap-reports/zap-*.html
+            ${{ github.workspace }}/zap-reports/zap-*.xml
+            ${{ github.workspace }}/zap-reports/zap-*.json
+
+      - name: Cleanup Docker
+        if: always()
+        run: |
+          docker stop test-app || true
+          docker rm test-app || true
+          docker network rm dast-network || true
